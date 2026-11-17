@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Phil\LtiBundle\Infrastructure\Controller;
 
+use Phil\Lti\Contract\LineItemStore;
 use Phil\Lti\Exception\AccessDenied;
 use Phil\Lti\Exception\InvalidData;
 use Phil\Lti\Platform\Ags\AgsService;
@@ -25,9 +26,13 @@ use Symfony\Component\HttpFoundation\Response;
 
 /**
  * The Assignment and Grade Services of the platform over HTTP: the line items of a context — listed with their filters
- * and pages, read, created, changed, deleted —, the scores sent to a line item, and its results. Each call carries a
+ * a page at a time, the next page in the `Link` header with the limit the page was cut at, read, created, changed,
+ * deleted —, the scores sent to a line item, and its results. Each call carries a
  * bearer token of the scope it needs; a context or a line item that is not the tool's answers 404. Every change is
  * told to the application by an event.
+ *
+ * A score needs the `score` scope alone: the line item its event carries is read from the store, once the service has
+ * found it the tool's, not through the line item service, whose scopes the token of a score does not have to grant.
  */
 final readonly class AgsController
 {
@@ -44,6 +49,7 @@ final readonly class AgsController
         private AgsService $ags,
         private PlatformUrls $urls,
         private EventDispatcherInterface $events,
+        private LineItemStore $lineItems,
     ) {
     }
 
@@ -56,26 +62,24 @@ final readonly class AgsController
                 return $this->create($request, $token, $context);
             }
 
-            $limit = ServiceResponses::intQuery($request, 'limit');
-            $offset = ServiceResponses::intQuery($request, 'offset') ?? 0;
-            $items = $this->ags->lineItems($token, $context, ServiceResponses::stringQuery($request, 'resource_link_id'), ServiceResponses::stringQuery($request, 'resource_id'), ServiceResponses::stringQuery($request, 'tag'), null === $limit ? null : $limit + 1, $offset);
+            $filters = ['resource_link_id' => ServiceResponses::stringQuery($request, 'resource_link_id'), 'resource_id' => ServiceResponses::stringQuery($request, 'resource_id'), 'tag' => ServiceResponses::stringQuery($request, 'tag')];
+            $page = $this->ags->lineItems($token, $context, $filters['resource_link_id'], $filters['resource_id'], $filters['tag'], ServiceResponses::intQuery($request, 'limit'), ServiceResponses::intQuery($request, 'offset') ?? 0);
         } catch (AccessDenied $accessDenied) {
             return ServiceResponses::denied($accessDenied);
         }
 
-        if (null === $items) {
+        if (null === $page) {
             return ServiceResponses::notFound();
         }
 
         $headers = [];
 
-        if (null !== $limit && \count($items) > $limit) {
-            $items = \array_slice($items, 0, max(1, $limit));
-            $query = array_filter(['resource_link_id' => $request->query->get('resource_link_id'), 'resource_id' => $request->query->get('resource_id'), 'tag' => $request->query->get('tag'), 'limit' => $limit, 'offset' => $offset + \count($items)], static fn (mixed $value): bool => null !== $value);
+        if (null !== $page['nextOffset']) {
+            $query = array_filter($filters + ['limit' => $page['limit'], 'offset' => $page['nextOffset']], static fn (string|int|null $value): bool => null !== $value);
             $headers['Link'] = '<'.$this->urls->url(self::LINE_ITEMS_ROUTE, ['context' => $context] + $query)->toString().'>; rel="next"';
         }
 
-        return ServiceResponses::json(array_map($this->present(...), $items), MediaType::LINE_ITEM_CONTAINER, headers: $headers);
+        return ServiceResponses::json(array_map($this->present(...), $page['lineItems']), MediaType::LINE_ITEM_CONTAINER, headers: $headers);
     }
 
     public function lineItem(Request $request, string $context, string $id): Response
@@ -147,7 +151,7 @@ final readonly class AgsController
             return ServiceResponses::error('The score is older than the latest kept for the learner.', Response::HTTP_CONFLICT);
         }
 
-        $item = $this->ags->lineItem($token, $context, $id);
+        $item = $this->lineItems->find($token->clientId, $context, $id);
 
         if ($item instanceof StoredLineItem) {
             $this->events->dispatch(new ScoreReceived($item, $score));

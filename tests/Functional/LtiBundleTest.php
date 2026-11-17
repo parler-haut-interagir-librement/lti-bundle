@@ -4,14 +4,18 @@ declare(strict_types=1);
 
 namespace Phil\LtiBundle\Tests\Functional;
 
+use DateTimeImmutable;
 use Doctrine\DBAL\Connection;
 use DOMElement;
 use LogicException;
 use Override;
 use Phil\Lti\Contract\KeyStore;
+use Phil\Lti\Contract\LineItemStore;
 use Phil\Lti\Contract\ServiceClient;
 use Phil\Lti\DeepLinking\LinkItem;
+use Phil\Lti\Http\FormPost;
 use Phil\Lti\Http\SafeHttpServiceClient;
+use Phil\Lti\Jwt\Jwt;
 use Phil\Lti\Jwt\JwtSigner;
 use Phil\Lti\Key\KeySet;
 use Phil\Lti\Message\DeepLinkingSettings;
@@ -20,11 +24,15 @@ use Phil\Lti\Message\LaunchMessage;
 use Phil\Lti\Message\MessageType;
 use Phil\Lti\Message\Person;
 use Phil\Lti\Message\Roles;
+use Phil\Lti\Platform\Ags\StoredLineItem;
+use Phil\Lti\Platform\DeepLinkingResult;
 use Phil\Lti\Platform\LaunchStarter;
 use Phil\Lti\Registration\InMemoryToolRegistrations;
 use Phil\Lti\Service\AccessTokenProvider;
+use Phil\Lti\Service\Ags\LineItem;
 use Phil\Lti\Service\Scope;
 use Phil\Lti\Tool\DeepLinkingResponder;
+use Phil\LtiBundle\Application\Contract\DeepLinkingReturns;
 use Phil\LtiBundle\Application\Event\DeepLinkingReturned;
 use Phil\LtiBundle\Application\Event\LaunchReceived;
 use Phil\LtiBundle\Application\Event\LineItemDeleted;
@@ -53,6 +61,7 @@ use Phil\SafeHttp\SafeHttpClient;
 use Phil\Url\Url;
 use PHPUnit\Framework\Attributes\CoversClass;
 use ReflectionClass;
+use RuntimeException;
 use Symfony\Bundle\FrameworkBundle\Console\Application;
 use Symfony\Bundle\FrameworkBundle\KernelBrowser;
 use Symfony\Bundle\FrameworkBundle\Test\WebTestCase;
@@ -102,11 +111,37 @@ final class LtiBundleTest extends WebTestCase
 
         $tester = new CommandTester(new Application($this->client->getKernel())->find('phil:lti:schema'));
         self::assertSame(0, $tester->execute([]));
-        self::assertStringContainsString('7 tables missing', $tester->getDisplay());
+        self::assertStringContainsString('8 tables missing, 0 tables to change', $this->flat($tester->getDisplay()));
         $tester->execute(['--force' => true]);
-        self::assertStringContainsString('Created: phil_lti_nonce', $tester->getDisplay());
+        self::assertStringContainsString('Created: phil_lti_nonce', $this->flat($tester->getDisplay()));
+        self::assertStringContainsString('phil_lti_deep_linking. Changed: none.', $this->flat($tester->getDisplay()));
         $tester->execute([]);
-        self::assertStringContainsString('The LTI tables are there.', $tester->getDisplay());
+        self::assertStringContainsString('The LTI tables are up to date.', $this->flat($tester->getDisplay()));
+    }
+
+    public function testTheSchemaCommandBringsTablesOfTheFirstVersionUpToDate(): void
+    {
+        $connection = $this->service('doctrine.dbal.default_connection');
+        $this->assertInstanceOf(Connection::class, $connection);
+        $connection->executeStatement('DROP TABLE phil_lti_pending_score');
+        $connection->executeStatement('DROP TABLE phil_lti_deep_linking');
+        $connection->executeStatement('CREATE TABLE phil_lti_pending_score (id VARCHAR(64) NOT NULL, issuer VARCHAR(1024) NOT NULL, client_id VARCHAR(255) NOT NULL, line_item VARCHAR(2048) NOT NULL, payload CLOB NOT NULL, created_at BIGINT NOT NULL, PRIMARY KEY (id))');
+        $connection->executeStatement("INSERT INTO phil_lti_pending_score VALUES ('kept', 'https://lms.example.org', 'c', 'https://lms.example.org/items/1', '{}', 1)");
+
+        $tester = new CommandTester(new Application($this->client->getKernel())->find('phil:lti:schema'));
+        self::assertSame(0, $tester->execute([]));
+        $display = $this->flat($tester->getDisplay());
+        self::assertStringContainsString('1 tables missing, 1 tables to change', $display);
+        self::assertStringContainsString('CREATE TABLE phil_lti_deep_linking', $display);
+        self::assertStringContainsString('dispatched_at', $display);
+        self::assertStringContainsString('CREATE INDEX phil_lti_pending_score_refused', $display);
+        self::assertStringNotContainsString('DROP TABLE phil_lti_nonce', $display);
+
+        self::assertSame(0, $tester->execute(['--force' => true]));
+        self::assertStringContainsString('Created: phil_lti_deep_linking. Changed: phil_lti_pending_score.', $this->flat($tester->getDisplay()));
+        $tester->execute([]);
+        self::assertStringContainsString('The LTI tables are up to date.', $this->flat($tester->getDisplay()));
+        self::assertSame([['id' => 'kept', 'created_at' => 1, 'dispatched_at' => null, 'claimed_at' => null, 'refused_at' => null, 'refusal' => null]], array_map(static fn (array $row): array => ['id' => $row['id'], 'created_at' => is_numeric($row['created_at']) ? (int) $row['created_at'] : null] + array_intersect_key($row, ['dispatched_at' => 1, 'claimed_at' => 1, 'refused_at' => 1, 'refusal' => 1]), $connection->fetchAllAssociative('SELECT * FROM phil_lti_pending_score')));
     }
 
     /**
@@ -310,6 +345,28 @@ final class LtiBundleTest extends WebTestCase
         self::assertSame([LineItemSaved::class, LineItemSaved::class, LineItemSaved::class, ScoreReceived::class, LineItemDeleted::class], $events);
     }
 
+    public function testAScoreIsKeptAndToldWithATokenOfTheScoreScopeAlone(): void
+    {
+        $base = 'https://localhost/lti/platform/contexts/course-1';
+        $this->client->request('POST', $base.'/lineitems', server: ['HTTP_AUTHORIZATION' => 'Bearer '.$this->token(Scope::LINE_ITEM)], content: '{"scoreMaximum":10,"label":"Quiz"}');
+        $url = $this->json((string) $this->client->getResponse()->getContent())['id'] ?? null;
+        self::assertIsString($url);
+
+        $score = '{"userId":"sub-ada","scoreGiven":7,"scoreMaximum":10,"activityProgress":"Completed","gradingProgress":"FullyGraded","timestamp":"2026-11-14T12:00:00.000Z"}';
+        $this->client->request('POST', $url.'/scores', server: ['HTTP_AUTHORIZATION' => 'Bearer '.$this->token(Scope::SCORE)], content: $score);
+
+        self::assertSame(204, $this->client->getResponse()->getStatusCode(), (string) $this->client->getResponse()->getContent());
+        $received = array_values(array_filter($this->service(RecordingListener::class)->events, static fn (object $event): bool => $event instanceof ScoreReceived));
+        self::assertCount(1, $received);
+        self::assertSame('Quiz', $received[0]->lineItem->lineItem->label);
+        self::assertSame(7.0, $received[0]->score->scoreGiven);
+
+        $this->client->request('GET', $url.'/results', server: ['HTTP_AUTHORIZATION' => 'Bearer '.$this->token(Scope::RESULT_READ_ONLY)]);
+        $results = $this->json((string) $this->client->getResponse()->getContent());
+        self::assertIsArray($results[0] ?? null);
+        self::assertSame(7.0, $results[0]['resultScore'] ?? null);
+    }
+
     public function testTheServicesRefuseWhatTheTokenDoesNotAllow(): void
     {
         $base = 'https://localhost/lti/platform/contexts/course-1';
@@ -365,6 +422,28 @@ final class LtiBundleTest extends WebTestCase
         self::assertSame(401, $this->client->getResponse()->getStatusCode());
     }
 
+    public function testThePageThatPostsALaunchSubmitsItselfByAScriptOfItsOwnNonce(): void
+    {
+        $post = new FormPost(Url::fromString('https://tool.example.com:8443/launch'), ['id_token' => 'a.b.c', 'state' => 's"<']);
+        $responder = $this->service(FormPostResponder::class);
+        $page = $responder->respond($post);
+        $other = $responder->respond($post);
+
+        $policy = (string) $page->headers->get('Content-Security-Policy');
+        self::assertSame(1, preg_match("#^script-src 'nonce-([A-Za-z0-9+/]{24})'; form-action https://tool\\.example\\.com:8443; frame-ancestors 'self' https://tool\\.example\\.com:8443$#", $policy, $match), $policy);
+        $content = (string) $page->getContent();
+        self::assertSame(1, substr_count($content, '<script nonce="'.$match[1].'">'));
+        self::assertStringContainsString('form.submit();', $content);
+        self::assertStringContainsString('})(document.currentScript.previousElementSibling);', $content);
+        self::assertMatchesRegularExpression('#</form>\s*<script nonce=#', $content);
+        self::assertStringContainsString('<input type="hidden" name="state" value="s&quot;&lt;">', $content);
+        self::assertStringContainsString('type="submit"', $content);
+        self::assertStringNotContainsString($match[1], (string) $other->getContent());
+        self::assertStringNotContainsString($match[1], (string) $other->headers->get('Content-Security-Policy'));
+        self::assertSame(200, $page->getStatusCode());
+        self::assertSame(422, $responder->respond($post, 422)->getStatusCode());
+    }
+
     public function testTheToolAnswersADeepLinkingRequest(): void
     {
         $settings = new DeepLinkingSettings(Url::fromString('https://localhost/lti/platform/deep-linking', true), ['link'], data: 'placement-7');
@@ -382,6 +461,83 @@ final class LtiBundleTest extends WebTestCase
         $returned = array_values(array_filter($this->service(RecordingListener::class)->events, static fn (object $event): bool => $event instanceof DeepLinkingReturned));
         self::assertCount(1, $returned);
         self::assertSame('placement-7', $returned[0]->result->data);
+    }
+
+    public function testADeepLinkingResponseWhoseHandlingFailedIsResumedWithoutItsToken(): void
+    {
+        $settings = new DeepLinkingSettings(Url::fromString('https://localhost/lti/platform/deep-linking', true), ['link'], data: 'placement-8');
+        $launch = new Launch(TestKernel::ISSUER, TestKernel::CLIENT, new LaunchMessage(MessageType::DeepLinking, '1', Url::fromString('https://localhost/course/1', true), new Person('sub-ada'), Roles::of([]), deepLinking: $settings), []);
+        $post = $this->service(DeepLinkingResponder::class)->respond($launch, [new LinkItem(Url::fromString('https://tool.example.com/page'), 'Page')], 'Added');
+        $nonce = Jwt::parse($post->fields['JWT'])->claims['nonce'] ?? null;
+        self::assertIsString($nonce);
+        $key = DeepLinkingResult::key(TestKernel::CLIENT, $nonce);
+        $listener = $this->service(RecordingListener::class);
+        $listener->failure = new RuntimeException('The gradebook is down.');
+
+        $this->client->catchExceptions(true);
+        $this->client->request('POST', $post->action->toString(), $post->fields);
+        self::assertSame(500, $this->client->getResponse()->getStatusCode());
+        $this->client->request('POST', $post->action->toString(), $post->fields);
+        self::assertSame(400, $this->client->getResponse()->getStatusCode(), 'The token is taken once.');
+        self::assertStringContainsString('already used', (string) $this->client->getResponse()->getContent());
+
+        $kept = $this->service(DeepLinkingReturns::class)->find($key, new DateTimeImmutable());
+        self::assertNotNull($kept);
+        self::assertNull($kept->handledAt);
+
+        $tester = new CommandTester(new Application($this->client->getKernel())->find('phil:lti:resume-deep-linking'));
+        self::assertSame(0, $tester->execute(['key' => $key]));
+        self::assertStringContainsString('Handled 1 responses again; 0 failed.', $this->flat($tester->getDisplay()));
+
+        $returned = array_values(array_filter($listener->events, static fn (object $event): bool => $event instanceof DeepLinkingReturned));
+        self::assertCount(2, $returned);
+        self::assertSame([$key, false, 'placement-8'], [$returned[0]->key, $returned[0]->resumed, $returned[0]->result->data]);
+        self::assertSame([$key, true, 'placement-8'], [$returned[1]->key, $returned[1]->resumed, $returned[1]->result->data]);
+        self::assertEquals($returned[0]->result, $returned[1]->result);
+        self::assertNotNull($this->service(DeepLinkingReturns::class)->find($key, new DateTimeImmutable())?->handledAt);
+    }
+
+    public function testTheLineItemsArePagedByDefaultAndAtTheMaximum(): void
+    {
+        $store = $this->service(LineItemStore::class);
+        $connection = $this->service('doctrine.dbal.default_connection');
+        $this->assertInstanceOf(Connection::class, $connection);
+        $connection->transactional(static function () use ($store): void {
+            for ($i = 0; $i <= 1000; ++$i) {
+                $store->save(new StoredLineItem(\sprintf('%032x', $i), TestKernel::CLIENT, 'course-1', new LineItem(1.0, 'L', tag: 0 === $i % 2 ? 'even' : 'odd')));
+            }
+        });
+
+        $base = 'https://localhost/lti/platform/contexts/course-1';
+        $auth = ['HTTP_AUTHORIZATION' => 'Bearer '.$this->token(Scope::LINE_ITEM_READ_ONLY)];
+        $this->client->request('GET', $base.'/lineitems', server: $auth);
+        $page = $this->client->getResponse();
+        self::assertSame(200, $page->getStatusCode());
+        self::assertCount(100, $this->json((string) $page->getContent()));
+        self::assertSame('<'.$base.'/lineitems?limit=100&offset=100>; rel="next"', $page->headers->get('Link'));
+
+        $this->client->request('GET', $base.'/lineitems?limit=5000&tag=even', server: $auth);
+        self::assertCount(501, $this->json((string) $this->client->getResponse()->getContent()));
+        self::assertNull($this->client->getResponse()->headers->get('Link'));
+
+        $this->client->request('GET', $base.'/lineitems?limit=5000', server: $auth);
+        self::assertCount(1000, $this->json((string) $this->client->getResponse()->getContent()));
+        self::assertSame('<'.$base.'/lineitems?limit=1000&offset=1000>; rel="next"', $this->client->getResponse()->headers->get('Link'));
+
+        $this->client->request('GET', $base.'/lineitems?limit=1000&offset=1000', server: $auth);
+        self::assertCount(1, $this->json((string) $this->client->getResponse()->getContent()));
+        self::assertNull($this->client->getResponse()->headers->get('Link'));
+
+        $this->client->request('GET', $base.'/lineitems?limit=2&tag=odd&resource_id=&offset=4', server: $auth);
+        self::assertSame('<'.$base.'/lineitems?tag=odd&limit=2&offset=6>; rel="next"', $this->client->getResponse()->headers->get('Link'));
+    }
+
+    /**
+     * The output of a command on one line, as wide as the terminal that runs the test may be.
+     */
+    private function flat(string $display): string
+    {
+        return (string) preg_replace('/\s+/', ' ', $display);
     }
 
     private function token(string ...$scopes): string

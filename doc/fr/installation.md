@@ -1,4 +1,4 @@
-<!-- phil-dev source-sha256=ed41c2cbe2f84eeb199274e0022a98cf122f66e2c8a25caade0f7b1fd30f3dd9 -->
+<!-- phil-dev source-sha256=19288f1137adae1766e1352d8c4cb9b1ff23628f5abdb8f98e24e92d5c916999 -->
 # Installation
 
 ## Prérequis
@@ -8,8 +8,8 @@
 - Doctrine DBAL 4 avec DoctrineBundle, pour le magasin `dbal` ;
 - le KeyManagement de Symfony avec un client KMS, pour les clés gardées dans la table ;
 - facultatif : l'ORM, pour les migrations ; Console, pour les commandes ; Messenger, pour envoyer les notes par un
-  bus ; AssetMapper et StimulusBundle, pour le contrôleur du formulaire ; les composants Twig de UX et la recette
-  `Button` du kit, pour son bouton.
+  bus ; AssetMapper et StimulusBundle, pour le contrôleur du formulaire sur une page propre à l'application ; les
+  composants Twig de UX et la recette `Button` du kit, pour son bouton.
 
 ## Installation
 
@@ -70,14 +70,15 @@ plutôt le fournisseur de l'application, ou une chaîne des deux.
 
 ## Les tables
 
-Avec l'ORM, le bundle ajoute ses sept tables au schéma que l'ORM génère pour la connexion :
+Avec l'ORM, le bundle ajoute ses huit tables au schéma que l'ORM génère pour la connexion :
 
 ```sh
 bin/console doctrine:migrations:diff
 bin/console doctrine:migrations:migrate
 ```
 
-Sans l'ORM, `bin/console phil:lti:schema` affiche le SQL des tables manquantes et `--force` l'exécute. Voir le
+Sans l'ORM, `bin/console phil:lti:schema` affiche le SQL des tables manquantes et des colonnes qui manquent aux tables
+qui s'y trouvent, et `--force` l'exécute. Une application qui vient de 0.1 suit la mise à niveau du
 [stockage](storage.md).
 
 ## Le kit et les ressources
@@ -93,8 +94,10 @@ Le `Button` du kit Shadcn prend les mêmes propriétés. La recette se trouve so
 configuration `ux_toolkit` ; là où le Toolkit n'est pas activé, comme en production, répétez-le dans
 `kit_subdirectory`.
 
-Avec AssetMapper, le bundle sert son contrôleur Stimulus sous le nom `@phil/lti-bundle`. Activez-le dans
-`assets/controllers.json` :
+La page du bundle envoie son formulaire par un script en ligne sous le nonce de sa politique, sans les scripts de
+l'application (voir la page de sécurité). Avec AssetMapper, le bundle sert aussi un contrôleur Stimulus sous le nom
+`@phil/lti-bundle`, pour un gabarit de l'application qui charge sa propre importmap ; un formulaire déjà envoyé est
+laissé tel quel. Activez-le dans `assets/controllers.json` :
 
 ```json
 {
@@ -108,6 +111,7 @@ Avec AssetMapper, le bundle sert son contrôleur Stimulus sous le nom `@phil/lti
 
 ## Tâches planifiées
 
-Exécutez `phil:lti:purge` chaque jour, pour retirer les nonces, les états de connexion et les jetons d'accès expirés, et
-`phil:lti:rotate-keys --if-due` chaque jour, pour renouveler la clé de signature une fois qu'elle atteint sa durée de
-vie.
+Exécutez `phil:lti:purge` chaque jour, pour retirer les nonces, les états de connexion, les jetons d'accès et les
+réponses de Deep Linking expirés et les notes refusées au-delà de leur conservation, et `phil:lti:rotate-keys --if-due`
+chaque jour, pour renouveler la clé de signature une fois qu'elle atteint sa durée de vie. Un outil exécute aussi
+`phil:lti:recover-scores` toutes les quelques minutes, pour renvoyer les notes dont le message n'a jamais été envoyé.
